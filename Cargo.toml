@@ -1,0 +1,32 @@
+[package]
+name = "zk-snark"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+
+[dependencies]
+ark-ff        = "0.5.0"
+ark-relations = "0.5.0"
+ark-poly      = "0.5.0"
+ark-std       = "0.5.0"
+ark-serialize = "0.5.0"
+ark-crypto-primitives = { version = "0.5.0", features = ["merkle_tree"] }
+sha2   = "0.11"
+rand   = "0.8"
+
+[dev-dependencies]
+ark-ec              = "0.5.0"
+ark-r1cs-std        = "0.5.0"
+ark-bls12-381       = "0.5.0"
+ark-ed-on-bls12-381 = { version = "0.5.0", features = ["r1cs"] }
+ark-crypto-primitives = { version = "0.5.0", features = ["r1cs"] }
+
+[[example]]
+name = "sudoku_solution"
+
+[[example]]
+name = "merkle_tree_inclusion"
+
+[[example]]
+name = "eddsa_verification"
