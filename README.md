@@ -1,35 +1,49 @@
 # zk-snark
 
-A Rust implementation of a simple zero-knowledge SNARK for arithmetic circuits.
+A Rust implementation of a zero-knowledge SNARK for arithmetic circuits.
 
 > **Academic use only.** This code was built as a teaching tool companion to a book chapter on probabilistic proof systems and zero knowledge. It has not been audited for security and should not be used in production.
 
-## Construction
+## Book chapter construction
 
-The overall argument system follows [Spartan](https://eprint.iacr.org/2019/550).
-We depart from the original in that the succinct matrix evaluations use a direct sumcheck over the nonzero set rather than Spark. This is simpler but costs an extra logarithmic factor.
+The chapter follows [Spartan](https://eprint.iacr.org/2019/550), replacing Spark
+with a direct sumcheck over the matrix nonzeros. This is simpler but costs an
+extra logarithmic factor.
 
-The polynomial commitment scheme follows [BaseFold](https://eprint.iacr.org/2023/1705),
-which we simplify by folding directly along the evaluation point instead of running its
-interleaved sumcheck. This is sound, as the evaluation point is the sumcheck's random challenge, but confines it to the unique-decoding regime, implying
-a larger *t* (as defined below).
+Its polynomial commitment scheme simplifies [BaseFold](https://eprint.iacr.org/2023/1705),
+using Reed–Solomon encodings, Merkle commitments, and folding along the evaluation
+point. The zero-knowledge layer combines witness blinding with
+[Libra](https://eprint.iacr.org/2019/317)-style additive sumcheck masks.
+Fiat–Shamir makes the protocol non-interactive.
 
-The zero-knowledge layer follows [Libra](https://eprint.iacr.org/2019/317)'s additive
-sumcheck masks, with two departures:
-1. Libra's standalone constant-term mask is dropped: the sumcheck consistency check
-already pins that coefficient.
-2. Our hash-based evaluation proofs open raw codeword symbols, which Libra's
-pairing-based commitments never do, so every committed table carries enough uniform
-randomness to make the opened symbols uniform too (via an [Aurora](https://eprint.iacr.org/2018/828)-style randomized encoding).
+## Errata
+
+The implementation includes the following corrections to the chapter:
+
+1. **Commitment order.** Each folded root must be committed before the next
+   folding challenge. Openings at an already known point use a fresh degree-two
+   evaluation sumcheck.
+2. **Sumcheck masking.** Mask all three outer terminal claims and include
+   independent constants in the additive masks. The outer sumcheck has degree
+   five; the inner sumcheck remains degree two.
+3. **Witness openings.** Prove the final witness/mask identity as one private
+   linear relation, without revealing the witness or inner-mask evaluation.
+   The hiding opening follows [Chiesa–Fenzi–Weissenberg](https://eprint.iacr.org/2026/391),
+   using randomized Reed–Solomon encodings, masked sumchecks, and masked responses.
+   Each private encoding is opened once, with fresh randomness covering its query budget.
 
 ## Complexity
 
 Let
 
-- *N* — the number of constraints
-- *λ = 128* — the security parameter
-- *ρ = 1/8* — the Reed–Solomon rate
-- *t = ⌈λ / log₂(2/(1+ρ))⌉ = 155* - queries per evaluation proof
+- *N* — a bound on constraints, variables, and total matrix nonzeros
+- *λ = 128* — the security target in bits
+- *ρ = 1/8* — the Reed–Solomon rate bound
+- *t = ⌈λ / log₂(2/(1+ρ))⌉ = 155* — queries per opening
+
+With security parameters and the number of public inputs fixed, the asymptotic
+bounds in N remain as below. Field and hash operations count at unit cost;
+proof size is measured in field elements and hash digests.
 
 | Phase    | Complexity |
 |----------|------------|
@@ -47,14 +61,15 @@ cargo test
 ## Usage steps
 
 1. Implement `ConstraintSynthesizer<F>` from `ark-relations`.
-2. Run a one-time `setup(circuit, zk)` to obtain the prover and verifier parameters
-   `(pp, vp)`. Only the circuit's structure is read,
-   so leave both the public-input and witness
-   fields empty. When the circuit layout depends on data, pass that as a
-   separate field (e.g. the clue positions in the Sudoku example). Pass
+2. Run a one-time `setup(circuit, zk)` and handle its `Result` to obtain the
+   prover and verifier parameters `(pp, vp)`. Only canonical R1CS constraints are
+   supported. Only the circuit's structure is read, so leave both the public-input
+   and witness fields empty. When the circuit layout depends on data, pass that
+   as a separate field (e.g. the clue positions in the Sudoku example). Pass
    `zk: true` if you intend to produce zero-knowledge proofs.
-3. Call `prove(&pp, circuit, zk, rng)` with the same circuit but the
-   public-input and witness fields filled in. Pass `zk: false` for a non-hiding proof.
+3. Call `prove(&pp, circuit, zk, rng)` with the same R1CS circuit but the
+   public-input and witness fields filled in and a cryptographic RNG. Pass
+   `zk: false` for a non-hiding proof.
 4. Build the `public_inputs` vector and call `verify(&vp, &public_inputs, &proof)`.
 
 ## Examples

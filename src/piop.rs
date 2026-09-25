@@ -1,31 +1,26 @@
-//! The two-layer Spartan PIOP from the chapter.
+//! The non-hiding two-layer Spartan PIOP.
 //!
 //! The degree-3 outer sumcheck proves the R1CS identity; the batched degree-2
 //! inner sumcheck reduces `Q_A + ρQ_B + γQ_C` to the witness and matrix MLEs at
-//! one point. ZK mode adds the degree-matched additive masks whose terminal
-//! values are bound in `mask.rs`.
+//! one point. ZK proofs use the masked reduction in `zk_piop`.
 use ark_ff::PrimeField;
 use ark_relations::gr1cs::Matrix;
 use ark_serialize::CanonicalSerialize;
-use ark_std::{rand::Rng, UniformRand};
 
 use crate::{
-    r1cs::{build_eq_table, mle_of_matrix_at, mle_of_vector, q_eval, ConstraintMatrices},
-    sumcheck::{
-        additive_mask_eval, additive_mask_round, additive_mask_sum, sample_additive_mask,
-        sumcheck_verify, SumcheckProof,
-    },
+    r1cs::{ConstraintMatrices, build_eq_table, mle_of_matrix_at, mle_of_vector, q_eval},
+    sumcheck::{SumcheckProof, sumcheck_verify, sumcheck_verify_interleaved},
     transcript::Transcript,
 };
-
-/// Per-variable degree of the additive masks: outer summand is degree 3, inner is degree 2.
-const OUTER_MASK_DEG: usize = 3;
-const INNER_MASK_DEG: usize = 2;
 
 /// ceil(log2(n)), with a minimum of 1.
 pub fn ell_for(n: usize) -> usize {
     assert!(n > 0, "ell_for: n must be > 0");
-    if n <= 2 { 1 } else { (n - 1).ilog2() as usize + 1 }
+    if n <= 2 {
+        1
+    } else {
+        (n - 1).ilog2() as usize + 1
+    }
 }
 
 #[derive(CanonicalSerialize)]
@@ -46,18 +41,11 @@ pub struct PiopProof<F: PrimeField> {
     pub a_eval: F,
     pub b_eval: F,
     pub c_eval: F,
-    /// ZK: terminal mask evaluations Z_out(x*), Z_in(y*). Bound to the mask
-    /// commitments by the inner-product proofs in `snark.rs` (`mask.rs`).
-    pub z_out_eval: Option<F>,
-    pub z_in_eval: Option<F>,
-    /// ZK: declared mask sums used in the masked sumchecks' initial claims.
-    pub z_out_sum: Option<F>,
-    pub z_in_sum: Option<F>,
 }
 
 /// Row-product table: table[i] = ∑_j M[i,j]·w[j].
 /// At boolean x = i this equals Q_M(i).
-fn build_mw_table<F: PrimeField>(m: &Matrix<F>, w: &[F], ell_row: usize) -> Vec<F> {
+pub(crate) fn build_mw_table<F: PrimeField>(m: &Matrix<F>, w: &[F], ell_row: usize) -> Vec<F> {
     let n = 1 << ell_row;
     let mut table = vec![F::zero(); n];
     for (i, row) in m.iter().enumerate() {
@@ -71,7 +59,7 @@ fn build_mw_table<F: PrimeField>(m: &Matrix<F>, w: &[F], ell_row: usize) -> Vec<
 /// Column-weight table for the batched inner polynomial at point x*:
 ///   table[col] = ∑_row (A + ρ·B + γ·C)[row,col] · eq(row, x_star)
 /// At boolean y = col this equals (Ã + ρ·B̃ + γ·C̃)(x_star, col).
-fn build_abc_col_table<F: PrimeField>(
+pub(crate) fn build_abc_col_table<F: PrimeField>(
     a: &Matrix<F>,
     b: &Matrix<F>,
     c: &Matrix<F>,
@@ -105,31 +93,22 @@ fn build_abc_col_table<F: PrimeField>(
     table
 }
 
-/// Outer sumcheck: ∑_x eq(x,r)·[A(x)·B(x) − C(x)] (+ τ·Z_out) = τ·S_out, degree 3.
-///
-/// Each round evaluates s_j(t) at t = 0,1,2,3 using the bookkeeping tables, adds the
-/// additive mask's analytic round contribution (scaled by τ), then folds the tables.
-/// Returns (proof, challenges x*, Z_out(x*), Σ_x Z_out(x)) — the last two are `None`
-/// when not in ZK mode.
+/// Degree-three sumcheck of eq(x,r) [A(x) B(x) - C(x)], with claimed sum zero.
 fn sumcheck_outer_bookkeeping<F: PrimeField>(
     mut eq_tbl: Vec<F>,
     mut a_tbl: Vec<F>,
     mut b_tbl: Vec<F>,
     mut c_tbl: Vec<F>,
     ell: usize,
-    coeffs: Option<Vec<Vec<F>>>,
-    mask_combiner: F,
     transcript: &mut Transcript,
-) -> (SumcheckProof<F>, Vec<F>, Option<F>, Option<F>) {
-    let mask_sum = coeffs.as_ref().map(|c| additive_mask_sum(c));
-
-    transcript.absorb_field(mask_combiner * mask_sum.unwrap_or(F::zero()));
+) -> (SumcheckProof<F>, Vec<F>) {
+    transcript.absorb_field(F::zero());
 
     let mut challenges = Vec::with_capacity(ell);
     let mut round_polys = Vec::with_capacity(ell);
     let mut current = 1usize << ell;
 
-    for round_i in 0..ell {
+    for _ in 0..ell {
         let half = current / 2;
         let mut s_j = vec![F::zero(); 4];
 
@@ -154,13 +133,6 @@ fn sumcheck_outer_bookkeeping<F: PrimeField>(
             }
         }
 
-        if let Some(ref c) = coeffs {
-            let mc = additive_mask_round(c, round_i, &challenges);
-            for t in 0..4 {
-                s_j[t] += mask_combiner * mc[t];
-            }
-        }
-
         for &v in &s_j {
             transcript.absorb_field(v);
         }
@@ -178,26 +150,19 @@ fn sumcheck_outer_bookkeeping<F: PrimeField>(
         current = half;
     }
 
-    let z_eval = coeffs.as_ref().map(|c| additive_mask_eval(c, &challenges));
-    (SumcheckProof { round_polys }, challenges, z_eval, mask_sum)
+    (SumcheckProof { round_polys }, challenges)
 }
 
-/// Inner sumcheck: ∑_y combined(y)·w(y) (+ τ·Z_in) = claimed_sum + τ·S_in, degree 2.
-///
-/// `claimed_sum` is the unmasked base claim q_abc_claim; the masked claim absorbed is
-/// `claimed_sum + τ·S_in`. Returns (proof, challenges y*, Z_in(y*), Σ_y Z_in(y)).
+/// Degree-two sumcheck of combined(y) W(y), folding the PCS in each round.
 fn sumcheck_inner_bookkeeping<F: PrimeField>(
     mut a_tbl: Vec<F>,
     mut w_tbl: Vec<F>,
     ell: usize,
     claimed_sum: F,
-    coeffs: Option<Vec<Vec<F>>>,
-    mask_combiner: F,
     transcript: &mut Transcript,
-) -> (SumcheckProof<F>, Vec<F>, Option<F>, Option<F>) {
-    let mask_sum = coeffs.as_ref().map(|c| additive_mask_sum(c));
-
-    transcript.absorb_field(claimed_sum + mask_combiner * mask_sum.unwrap_or(F::zero()));
+    mut after_challenge: impl FnMut(usize, F, &mut Transcript),
+) -> (SumcheckProof<F>, Vec<F>) {
+    transcript.absorb_field(claimed_sum);
 
     let mut challenges = Vec::with_capacity(ell);
     let mut round_polys = Vec::with_capacity(ell);
@@ -219,17 +184,11 @@ fn sumcheck_inner_bookkeeping<F: PrimeField>(
             s_j[2] += (two * a1 - a0) * (two * w1 - w0);
         }
 
-        if let Some(ref c) = coeffs {
-            let mc = additive_mask_round(c, round_i, &challenges);
-            for t in 0..3 {
-                s_j[t] += mask_combiner * mc[t];
-            }
-        }
-
         for &v in &s_j {
             transcript.absorb_field(v);
         }
         let r = transcript.squeeze_field::<F>();
+        after_challenge(round_i, r, transcript);
         challenges.push(r);
         round_polys.push(s_j);
 
@@ -241,64 +200,37 @@ fn sumcheck_inner_bookkeeping<F: PrimeField>(
         current = half;
     }
 
-    let z_eval = coeffs.as_ref().map(|c| additive_mask_eval(c, &challenges));
-    (SumcheckProof { round_polys }, challenges, z_eval, mask_sum)
+    (SumcheckProof { round_polys }, challenges)
 }
 
-/// Commit the declared mask sum to the Fiat--Shamir transcript before deriving τ.
-fn bind_mask_sum<F: PrimeField>(mask_sum: Option<F>, transcript: &mut Transcript) -> F {
-    if let Some(sum) = mask_sum {
-        transcript.absorb_field(sum);
-        transcript.squeeze_field()
-    } else {
-        F::zero()
-    }
-}
-
-pub fn piop_prove<F: PrimeField + UniformRand, R: Rng>(
+/// Run the PIOP, letting the PCS commit a fold immediately after each inner
+/// challenge. The hook runs before the next round polynomial is absorbed.
+pub fn piop_prove<F: PrimeField>(
     matrices: &ConstraintMatrices<F>,
     w: &[F],
     ell_row: usize,
     ell_col: usize,
     transcript: &mut Transcript,
-    zk: bool,
-    z_out_coeffs: Option<Vec<Vec<F>>>,
-    z_in_coeffs: Option<Vec<Vec<F>>>,
-    rng: &mut R,
+    after_inner_challenge: impl FnMut(usize, F, &mut Transcript),
 ) -> (PiopProof<F>, Vec<F>, Vec<F>, F) {
-    assert!(!matrices.a.is_empty(), "piop_prove: circuit has no constraints");
+    assert!(
+        !matrices.a.is_empty(),
+        "piop_prove: circuit has no constraints"
+    );
 
     // `w` is the full half-split assignment described in `snark.rs`.
     let mut w_pad = w.to_vec();
     w_pad.resize(1 << ell_col, F::zero());
 
-    let z_out_coeffs = if zk {
-        Some(z_out_coeffs.unwrap_or_else(|| sample_additive_mask(ell_row, OUTER_MASK_DEG, rng)))
-    } else {
-        None
-    };
-    let z_in_coeffs = if zk {
-        Some(z_in_coeffs.unwrap_or_else(|| sample_additive_mask(ell_col, INNER_MASK_DEG, rng)))
-    } else {
-        None
-    };
-    let declared_z_out_sum = z_out_coeffs.as_ref().map(|c| additive_mask_sum(c));
-    let declared_z_in_sum = z_in_coeffs.as_ref().map(|c| additive_mask_sum(c));
-
     let r: Vec<F> = (0..ell_row).map(|_| transcript.squeeze_field()).collect();
-
-    // The mask root and declared sum are both bound before this challenge.
-    let tau_out = bind_mask_sum(declared_z_out_sum, transcript);
 
     let eq_tbl = build_eq_table(&r);
     let qa_tbl = build_mw_table(&matrices.a, &w_pad, ell_row);
     let qb_tbl = build_mw_table(&matrices.b, &w_pad, ell_row);
     let qc_tbl = build_mw_table(&matrices.c, &w_pad, ell_row);
 
-    let (outer_sc, x_star, z_out_eval, z_out_sum) = sumcheck_outer_bookkeeping(
-        eq_tbl, qa_tbl, qb_tbl, qc_tbl, ell_row, z_out_coeffs, tau_out, transcript,
-    );
-    debug_assert_eq!(z_out_sum, declared_z_out_sum);
+    let (outer_sc, x_star) =
+        sumcheck_outer_bookkeeping(eq_tbl, qa_tbl, qb_tbl, qc_tbl, ell_row, transcript);
 
     let q_a_claim = q_eval(&matrices.a, &w_pad, &x_star);
     let q_b_claim = q_eval(&matrices.b, &w_pad, &x_star);
@@ -307,33 +239,34 @@ pub fn piop_prove<F: PrimeField + UniformRand, R: Rng>(
     transcript.absorb_field(q_a_claim);
     transcript.absorb_field(q_b_claim);
     transcript.absorb_field(q_c_claim);
-    if let Some(z) = z_out_eval {
-        transcript.absorb_field(z);
-    }
 
     let rho: F = transcript.squeeze_field();
     let gamma: F = transcript.squeeze_field();
     let q_abc_claim = q_a_claim + rho * q_b_claim + gamma * q_c_claim;
 
-    let tau_in = bind_mask_sum(declared_z_in_sum, transcript);
-
     let abc_tbl = build_abc_col_table(
-        &matrices.a, &matrices.b, &matrices.c,
-        &x_star, rho, gamma, ell_col,
+        &matrices.a,
+        &matrices.b,
+        &matrices.c,
+        &x_star,
+        rho,
+        gamma,
+        ell_col,
     );
     let w_tbl = w_pad.clone();
 
-    let (inner_sc, y_star, z_in_eval, z_in_sum) = sumcheck_inner_bookkeeping(
-        abc_tbl, w_tbl, ell_col, q_abc_claim, z_in_coeffs, tau_in, transcript,
+    let (inner_sc, y_star) = sumcheck_inner_bookkeeping(
+        abc_tbl,
+        w_tbl,
+        ell_col,
+        q_abc_claim,
+        transcript,
+        after_inner_challenge,
     );
-    debug_assert_eq!(z_in_sum, declared_z_in_sum);
 
     let u = mle_of_vector(&w_pad, ell_col, &y_star);
 
     transcript.absorb_field(u);
-    if let Some(z) = z_in_eval {
-        transcript.absorb_field(z);
-    }
 
     // These matrix claims are certified against the preprocessing commitments later.
     let a_eval = mle_of_matrix_at(&matrices.a, &x_star, &y_star);
@@ -354,10 +287,6 @@ pub fn piop_prove<F: PrimeField + UniformRand, R: Rng>(
         a_eval,
         b_eval,
         c_eval,
-        z_out_eval,
-        z_in_eval,
-        z_out_sum,
-        z_in_sum,
     };
     (proof, x_star, y_star, u)
 }
@@ -367,67 +296,53 @@ pub fn piop_prove<F: PrimeField + UniformRand, R: Rng>(
 /// The matrix MLEs Ã,B̃,C̃ at (x*,y*) are taken as the *claimed* values
 /// `proof.{a,b,c}_eval`; the caller (snark verifier) must certify those against
 /// the preprocessing commitments via the matrix-evaluation proofs, and must still
-/// check the PCS openings of Z_out(x*), Z_in(y*), ŵ(y*).
+/// check the PCS opening of the private witness half.
+/// `after_inner_challenge` must replay the prover's interleaved fold messages.
 pub fn piop_verify<F: PrimeField>(
     ell_row: usize,
     ell_col: usize,
     proof: &PiopProof<F>,
     transcript: &mut Transcript,
+    after_inner_challenge: impl FnMut(usize, F, &mut Transcript) -> Option<()>,
 ) -> Option<(Vec<F>, Vec<F>, F)> {
     let r: Vec<F> = (0..ell_row).map(|_| transcript.squeeze_field()).collect();
 
-    let tau_out = match (proof.z_out_eval, proof.z_out_sum) {
-        (Some(_), Some(sum)) => bind_mask_sum(Some(sum), transcript),
-        (None, None) => F::zero(),
-        _ => return None,
-    };
-
-    let claimed_outer = tau_out * proof.z_out_sum.unwrap_or(F::zero());
     let (x_star, outer_final) =
-        sumcheck_verify(&proof.outer_sc, ell_row, 3, claimed_outer, transcript)?;
+        sumcheck_verify(&proof.outer_sc, ell_row, 3, F::zero(), transcript)?;
 
     let eq_val: F = (0..ell_row)
         .map(|j| x_star[j] * r[j] + (F::one() - x_star[j]) * (F::one() - r[j]))
         .product();
     let oracle_outer = eq_val * (proof.q_a_claim * proof.q_b_claim - proof.q_c_claim);
-    let unmasked_outer = outer_final - tau_out * proof.z_out_eval.unwrap_or(F::zero());
-    if unmasked_outer != oracle_outer {
+    if outer_final != oracle_outer {
         return None;
     }
 
     transcript.absorb_field(proof.q_a_claim);
     transcript.absorb_field(proof.q_b_claim);
     transcript.absorb_field(proof.q_c_claim);
-    if let Some(z) = proof.z_out_eval {
-        transcript.absorb_field(z);
-    }
 
     let rho: F = transcript.squeeze_field();
     let gamma: F = transcript.squeeze_field();
     let q_abc_claim = proof.q_a_claim + rho * proof.q_b_claim + gamma * proof.q_c_claim;
 
-    let tau_in = match (proof.z_in_eval, proof.z_in_sum) {
-        (Some(_), Some(sum)) => bind_mask_sum(Some(sum), transcript),
-        (None, None) => F::zero(),
-        _ => return None,
-    };
-
-    let claimed_inner = q_abc_claim + tau_in * proof.z_in_sum.unwrap_or(F::zero());
-    let (y_star, inner_final) =
-        sumcheck_verify(&proof.inner_sc, ell_col, 2, claimed_inner, transcript)?;
+    let (y_star, inner_final) = sumcheck_verify_interleaved(
+        &proof.inner_sc,
+        ell_col,
+        2,
+        q_abc_claim,
+        transcript,
+        after_inner_challenge,
+    )?;
 
     let u = proof.u;
 
     let expected_abc = (proof.a_eval + rho * proof.b_eval + gamma * proof.c_eval) * u;
-    let unmasked_abc = inner_final - tau_in * proof.z_in_eval.unwrap_or(F::zero());
-    if unmasked_abc != expected_abc {
+    if inner_final != expected_abc {
         return None;
     }
 
     transcript.absorb_field(u);
-    if let Some(z) = proof.z_in_eval {
-        transcript.absorb_field(z);
-    }
 
     transcript.absorb_field(proof.a_eval);
     transcript.absorb_field(proof.b_eval);
@@ -454,22 +369,8 @@ mod tests {
     }
 
     #[test]
-    fn mask_sum_is_bound_before_combiner() {
-        let mut first = Transcript::new(b"mask-order");
-        let mut second = Transcript::new(b"mask-order");
-
-        let tau_first = bind_mask_sum(Some(F::from(1u64)), &mut first);
-        let tau_second = bind_mask_sum(Some(F::from(2u64)), &mut second);
-
-        assert_ne!(tau_first, tau_second);
-    }
-
-    #[test]
     fn test_build_mw_table() {
-        let m: Matrix<F> = vec![
-            vec![(F::from(2u64), 0)],
-            vec![(F::from(3u64), 1)],
-        ];
+        let m: Matrix<F> = vec![vec![(F::from(2u64), 0)], vec![(F::from(3u64), 1)]];
         let w = vec![F::from(5u64), F::from(7u64)];
         let table = build_mw_table(&m, &w, 1);
 

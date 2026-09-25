@@ -9,6 +9,7 @@ use ark_relations::gr1cs::Matrix;
 use crate::sumcheck::eq_eval;
 
 /// The three matrices and dimensions of an R1CS instance.
+#[derive(PartialEq, Eq)]
 pub struct ConstraintMatrices<F: PrimeField> {
     pub a: Matrix<F>,
     pub b: Matrix<F>,

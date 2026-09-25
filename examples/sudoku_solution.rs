@@ -184,7 +184,15 @@ fn main() {
 
     let mut rng = StdRng::seed_from_u64(0);
 
-    let (pp, vp) = setup::<F, _>(SudokuCircuit { given, clues: None, solution: None }, true);
+    let (pp, vp) = setup::<F, _>(
+        SudokuCircuit {
+            given,
+            clues: None,
+            solution: None,
+        },
+        true,
+    )
+    .expect("setup failed");
 
     println!("Proving knowledge of 9x9 Sudoku solution (ZK mode)…");
     let proof = prove(

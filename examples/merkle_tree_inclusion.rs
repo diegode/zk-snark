@@ -140,12 +140,16 @@ fn main() {
         "native path verification failed"
     );
 
-    let (pp, vp) = setup::<F, _>(MerkleInclusionCircuit {
-        params: params.clone(),
-        root: None,
-        leaf: None,
-        auth_path: None,
-    }, true);
+    let (pp, vp) = setup::<F, _>(
+        MerkleInclusionCircuit {
+            params: params.clone(),
+            root: None,
+            leaf: None,
+            auth_path: None,
+        },
+        true,
+    )
+    .expect("setup failed");
 
     println!("Proving Merkle inclusion for leaf {secret_index} (ZK mode)…");
     let proof = prove(

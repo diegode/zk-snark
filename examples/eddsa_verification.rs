@@ -179,14 +179,18 @@ fn main() {
     let rhs_native = (r_point + pk * c_fr).into_affine();
     assert_eq!(lhs_native, rhs_native, "native Schnorr equation failed");
 
-    let (pp, vp) = setup::<Fq, _>(SchnorrCircuit {
-        params: params.clone(),
-        m: None,
-        cm: None,
-        s: None,
-        r_point: None,
-        pk: None,
-    }, true);
+    let (pp, vp) = setup::<Fq, _>(
+        SchnorrCircuit {
+            params: params.clone(),
+            m: None,
+            cm: None,
+            s: None,
+            r_point: None,
+            pk: None,
+        },
+        true,
+    )
+    .expect("setup failed");
 
     println!("Proving Schnorr signature knowledge (ZK mode)…");
     let proof = prove(

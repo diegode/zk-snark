@@ -4,7 +4,6 @@ use ark_crypto_primitives::{
     merkle_tree::{ByteDigestConverter, Config, MerkleTree},
 };
 use ark_ff::PrimeField;
-use rand::RngCore;
 
 pub struct MerkleConfig;
 
@@ -29,14 +28,15 @@ pub(crate) fn build_tree(leaves: &[Vec<u8>]) -> MerkleTree<MerkleConfig> {
     MerkleTree::<MerkleConfig>::new(&(), &(), leaves.iter().map(Vec::as_slice)).unwrap()
 }
 
-/// Target security level λ, in bits.
+/// Security target λ in bits. Sets the query budget for all openings.
+/// The complete protocol still needs a quantitative soundness analysis.
 pub const SECURITY_BITS: usize = 128;
 
-/// Proximity-check queries per fold round, `t = ⌈λ / log₂(2/(1+ρ))⌉`.
+/// Query paths per opening: `t = ⌈λ / log₂(2/(1+ρ))⌉`.
 ///
-/// In the chapter's unique-decoding analysis, a query misses a forged layer with
-/// probability at most `(1+ρ)/2`.
-/// (BLOWUP_BITS = 3 ⇒ ρ = 1/8 ⇒ t = ⌈128/0.830⌉ = 155.)
+/// The current selection rule gives 155 queries at λ=128 and rate 1/8.
+/// It is a heuristic allocation, not a bound on the complete protocol's error.
+/// ZK randomness and auxiliary-vector lengths scale with this query budget.
 pub fn num_queries() -> usize {
     let rho = 1.0 / BLOWUP as f64;
     let bits_per_query = (2.0 / (1.0 + rho)).log2();
@@ -48,34 +48,9 @@ pub fn num_queries() -> usize {
 pub const BLOWUP_BITS: usize = 3;
 pub const BLOWUP: usize = 1 << BLOWUP_BITS;
 
-pub(crate) fn make_leaf_bytes<F: PrimeField, R: RngCore>(
-    evals: &[F],
-    zk: bool,
-    rng: &mut R,
-) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
-    if !zk {
-        return make_leaf_bytes_public(evals);
-    }
-    let mut salts = Vec::with_capacity(evals.len());
-    let leaf_bytes = evals
-        .iter()
-        .map(|&v| {
-            let mut bytes = field_to_bytes(v);
-            let mut salt = vec![0u8; 16];
-            rng.fill_bytes(&mut salt);
-            bytes.extend_from_slice(&salt);
-            salts.push(salt);
-            bytes
-        })
-        .collect();
-    (leaf_bytes, salts)
-}
-
 /// Deterministic leaves for public preprocessing data such as the R1CS matrices.
-pub(crate) fn make_leaf_bytes_public<F: PrimeField>(evals: &[F]) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
-    let leaf_bytes = evals.iter().map(|&v| field_to_bytes(v)).collect();
-    let salts = vec![Vec::new(); evals.len()];
-    (leaf_bytes, salts)
+pub(crate) fn make_leaf_bytes_public<F: PrimeField>(evals: &[F]) -> Vec<Vec<u8>> {
+    evals.iter().map(|&v| field_to_bytes(v)).collect()
 }
 
 #[cfg(test)]
@@ -83,9 +58,9 @@ mod tests {
     use super::*;
     use ark_bls12_381::Fr;
     use ark_std::One;
+    use ark_std::UniformRand;
     use ark_std::Zero;
     use rand::thread_rng;
-    use ark_std::UniformRand;
 
     #[test]
     fn test_field_to_bytes() {
@@ -111,17 +86,13 @@ mod tests {
     }
 
     #[test]
-    fn num_queries_meets_security_target() {
+    fn query_budget_rounding() {
         let rho = 1.0 / BLOWUP as f64;
         let bits_per_query = (2.0 / (1.0 + rho)).log2();
         let target = SECURITY_BITS as f64;
 
         let t = num_queries();
-        assert!(
-            t as f64 * bits_per_query >= target,
-            "{t} queries give {:.1} bits < {target} target",
-            t as f64 * bits_per_query
-        );
+        assert!(t as f64 * bits_per_query >= target);
         assert!((t - 1) as f64 * bits_per_query < target);
     }
 }

@@ -14,11 +14,11 @@ use ark_relations::gr1cs::Matrix;
 
 use crate::{
     pcs::{
-        build_eval_public, commit_public, finalize_eval, verify_eval, PcsError,
+        commit_public, verify_queries, FoldProver, PcsError,
         Commitment, Proof, Witness,
     },
     piop::ell_for,
-    sumcheck::{sumcheck_verify, SumcheckProof},
+    sumcheck::{sumcheck_verify_interleaved, SumcheckProof},
     transcript::Transcript,
 };
 
@@ -38,6 +38,9 @@ impl MatrixCommitments {
     /// Bind all encoding roots to the transcript (val, then row bits, then column
     /// bits). Prover and verifier must call this in the same order.
     pub fn absorb_into(&self, transcript: &mut Transcript) {
+        for dimension in [self.s, self.ell_row, self.ell_col] {
+            transcript.absorb(&(dimension as u64).to_le_bytes());
+        }
         transcript.absorb(&self.val.root);
         for c in &self.rbits {
             transcript.absorb(&c.root);
@@ -151,6 +154,19 @@ fn eq_factor<F: PrimeField>(b: F, z: F) -> F {
     b * z + (F::one() - b) * (F::one() - z)
 }
 
+fn bind_statement<F: PrimeField>(
+    comm: &MatrixCommitments,
+    x: &[F],
+    y: &[F],
+    transcript: &mut Transcript,
+) {
+    transcript.absorb(b"matrix-eval/interleaved-v1");
+    comm.absorb_into(transcript);
+    for &v in x.iter().chain(y) {
+        transcript.absorb_field(v);
+    }
+}
+
 /// Prove `M̃(x*, y*) = v`, returning the value `v` and the evaluation proof.
 pub fn prove_matrix_eval<F: PrimeField + FftField>(
     enc: &MatrixEncoding<F>,
@@ -188,9 +204,17 @@ pub fn prove_matrix_eval<F: PrimeField + FftField>(
         acc
     };
 
+    bind_statement(&enc.commitments, x_star, y_star, transcript);
     transcript.absorb_field(v);
 
-    let mut challenges = Vec::with_capacity(s);
+    let witnesses: Vec<&Witness<F>> = std::iter::once(&enc.val_wit)
+        .chain(enc.rbit_wits.iter())
+        .chain(enc.cbit_wits.iter())
+        .collect();
+    let mut folds: Vec<_> = witnesses.iter()
+        .map(|w| FoldProver::new(&w.codeword))
+        .collect::<Result<_, _>>()?;
+
     let mut round_polys = Vec::with_capacity(s);
     let mut current = 1usize << s;
 
@@ -219,7 +243,11 @@ pub fn prove_matrix_eval<F: PrimeField + FftField>(
             transcript.absorb_field(e);
         }
         let r = transcript.squeeze_field::<F>();
-        challenges.push(r);
+        folds.par_iter_mut().for_each(|f| f.advance_public(r));
+        // Preserve val, row-bit, column-bit order independently of rayon scheduling.
+        for f in &folds {
+            f.absorb_latest(transcript);
+        }
         round_polys.push(s_j);
 
         let omr = F::one() - r;
@@ -235,21 +263,9 @@ pub fn prove_matrix_eval<F: PrimeField + FftField>(
         current = half;
     }
 
-    // Open every sparse-encoding table at the sumcheck's terminal point.
-    let witnesses: Vec<&Witness<F>> = std::iter::once(&enc.val_wit)
-        .chain(enc.rbit_wits.iter())
-        .chain(enc.cbit_wits.iter())
-        .collect();
-
-    let datas: Vec<_> = witnesses
-        .par_iter()
-        .map(|w| build_eval_public(w, &challenges))
-        .collect();
-
-    let proofs: Vec<Proof<F>> = witnesses
-        .iter()
-        .zip(datas)
-        .map(|(w, data)| finalize_eval(w, challenges.len(), data, transcript))
+    // Only query openings remain; the roots were sent during the sumcheck.
+    let proofs: Vec<Proof<F>> = witnesses.iter().zip(folds)
+        .map(|(w, f)| f.finish(w, transcript))
         .collect();
 
     let mut it = proofs.into_iter();
@@ -292,18 +308,27 @@ pub fn verify_matrix_eval<F: PrimeField + FftField>(
         return Ok(false);
     }
 
-    let Some((k_star, final_eval)) = sumcheck_verify(&proof.sc, s, d, claimed_v, transcript) else {
+    bind_statement(comm, x_star, y_star, transcript);
+    let Some((k_star, final_eval)) = sumcheck_verify_interleaved(
+        &proof.sc, s, d, claimed_v, transcript, |i, _, t| {
+            proof.val_proof.absorb_round(i, s, t)?;
+            for p in proof.rbit_proofs.iter().chain(&proof.cbit_proofs) {
+                p.absorb_round(i, s, t)?;
+            }
+            Some(())
+        },
+    ) else {
         return Ok(false);
     };
 
     let val_v = proof.val_proof.final_value;
-    if !verify_eval(&comm.val, &k_star, val_v, &proof.val_proof, transcript)? {
+    if !verify_queries(&comm.val, &k_star, val_v, &proof.val_proof, transcript)? {
         return Ok(false);
     }
     let mut rbit_v = Vec::with_capacity(ell_row);
     for (c, p) in comm.rbits.iter().zip(proof.rbit_proofs.iter()) {
         let v = p.final_value;
-        if !verify_eval(c, &k_star, v, p, transcript)? {
+        if !verify_queries(c, &k_star, v, p, transcript)? {
             return Ok(false);
         }
         rbit_v.push(v);
@@ -311,7 +336,7 @@ pub fn verify_matrix_eval<F: PrimeField + FftField>(
     let mut cbit_v = Vec::with_capacity(ell_col);
     for (c, p) in comm.cbits.iter().zip(proof.cbit_proofs.iter()) {
         let v = p.final_value;
-        if !verify_eval(c, &k_star, v, p, transcript)? {
+        if !verify_queries(c, &k_star, v, p, transcript)? {
             return Ok(false);
         }
         cbit_v.push(v);
